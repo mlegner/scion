@@ -39,9 +39,10 @@ import (
 	"github.com/scionproto/scion/go/lib/log"
 	sd "github.com/scionproto/scion/go/lib/sciond"
 	"github.com/scionproto/scion/go/lib/snet"
-	"github.com/scionproto/scion/go/lib/snet/squic"
+	"github.com/scionproto/scion/go/lib/snet/mpsquic"
 	"github.com/scionproto/scion/go/lib/sock/reliable"
 	"github.com/scionproto/scion/go/lib/spath"
+	"strings"
 )
 
 const (
@@ -58,6 +59,7 @@ const (
 var (
 	local  snet.Addr
 	remote snet.Addr
+	remotes []*snet.Addr
 	file   = flag.String("file", "",
 		"File containing the data to send, optional to test larger data (only client)")
 	interactive = flag.Bool("i", false, "Interactive mode")
@@ -159,7 +161,7 @@ func initNetwork() {
 		LogFatal("Unable to initialize SCION network", "err", err)
 	}
 	log.Debug("SCION network successfully initialized")
-	if err := squic.Init("", ""); err != nil {
+	if err := mpsquic.Init("", ""); err != nil {
 		LogFatal("Unable to initialize QUIC/SCION", "err", err)
 	}
 	log.Debug("QUIC/SCION successfully initialized")
@@ -190,25 +192,25 @@ func (m *message) len() int {
 	return len(m.PingPong) + len(m.Data) + 8
 }
 
-type quicStream struct {
+type mpQuicStream struct {
 	qstream quic.Stream
 	encoder *gob.Encoder
 	decoder *gob.Decoder
 }
 
-func newQuicStream(qstream quic.Stream) *quicStream {
-	return &quicStream{
+func newMPQuicStream(qstream quic.Stream) *mpQuicStream {
+	return &mpQuicStream{
 		qstream,
 		gob.NewEncoder(qstream),
 		gob.NewDecoder(qstream),
 	}
 }
 
-func (qs quicStream) WriteMsg(msg *message) error {
+func (qs mpQuicStream) WriteMsg(msg *message) error {
 	return qs.encoder.Encode(msg)
 }
 
-func (qs quicStream) ReadMsg() (*message, error) {
+func (qs mpQuicStream) ReadMsg() (*message, error) {
 	var msg message
 	err := qs.decoder.Decode(&msg)
 	if err != nil {
@@ -218,7 +220,7 @@ func (qs quicStream) ReadMsg() (*message, error) {
 }
 
 type client struct {
-	*quicStream
+	*mpQuicStream
 	qsess quic.Session
 }
 
@@ -232,15 +234,15 @@ func newClient() *client {
 func (c *client) run() {
 	// Needs to happen before DialSCION, as it will 'copy' the remote to the connection.
 	// If remote is not in local AS, we need a path!
-	c.setupPath()
+	c.setupPaths()
 	defer c.Close()
 
-	// Connect to remote address. Note that currently the SCION library
+	// Connect to remote addresses. Note that currently the SCION library
 	// does not support automatic binding to local addresses, so the local
 	// IP address needs to be supplied explicitly. When supplied a local
 	// port of 0, DialSCION will assign a random free local port.
 	var err error
-	c.qsess, err = squic.DialSCION(nil, &local, &remote, nil)
+	c.qsess, err = mpsquic.DialMPSCION(nil, &local, remotes, nil)
 	if err != nil {
 		LogFatal("Unable to dial", "err", err)
 	}
@@ -249,7 +251,7 @@ func (c *client) run() {
 	if err != nil {
 		LogFatal("quic OpenStream failed", "err", err)
 	}
-	c.quicStream = newQuicStream(qstream)
+	c.mpQuicStream = newMPQuicStream(qstream)
 	log.Debug("Quic stream opened", "local", &local, "remote", &remote)
 	go func() {
 		defer log.LogPanicAndExit()
@@ -269,20 +271,24 @@ func (c *client) Close() error {
 		// E.g. if you are just sending something to a server and closing the session immediately
 		// it might be that the server does not see the message.
 		// See also: https://github.com/lucas-clemente/quic-go/issues/464
-		err = c.qsess.Close()
+		err = c.qsess.Close(err)
 	}
 	return err
 }
 
-func (c client) setupPath() {
+func (c client) setupPaths() {
 	if !remote.IA.Equal(local.IA) {
-		pathEntry := choosePath(*interactive)
-		if pathEntry == nil {
+		pathEntries := choosePaths(*interactive)
+		if pathEntries == nil {
 			LogFatal("No paths available to remote destination")
 		}
-		remote.Path = spath.New(pathEntry.Path.FwdPath)
-		remote.Path.InitOffsets()
-		remote.NextHop, _ = pathEntry.HostInfo.Overlay()
+		for _, pathEntry := range pathEntries {
+			newRemote := remote.Copy()
+			newRemote.Path = spath.New(pathEntry.Path.FwdPath)
+			newRemote.Path.InitOffsets()
+			newRemote.NextHop, _ = pathEntry.HostInfo.Overlay()
+			remotes = append(remotes, newRemote)
+		}
 	}
 }
 
@@ -293,9 +299,21 @@ func (c client) send() {
 		}
 
 		reqMsg := requestMsg()
+		if (i > 0) {
+			mpsquic.SwitchMPSCIONConn(c.qsess)
+			fileData = []byte("We switched the connection: AAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+			reqMsg = &message{
+				PingPong: ReqMsg,
+				Data:     fileData,
+			}
+		}
+
 		// Send ping message to destination
 		before := time.Now()
 		reqMsg.Timestamp = before.UnixNano()
+
 		err := c.WriteMsg(reqMsg)
 		if err != nil {
 			log.Error("Unable to write", "err", err)
@@ -350,7 +368,7 @@ type server struct {
 // On any error, the server exits.
 func (s server) run() {
 	// Listen on SCION address
-	qsock, err := squic.ListenSCION(nil, &local, nil)
+	qsock, err := mpsquic.ListenSCION(nil, &local, nil)
 	if err != nil {
 		LogFatal("Unable to listen", "err", err)
 	}
@@ -376,7 +394,8 @@ func (s server) run() {
 }
 
 func (s server) handleClient(qsess quic.Session) {
-	defer qsess.Close()
+	var err error
+	defer qsess.Close(err)
 	qstream, err := qsess.AcceptStream()
 	if err != nil {
 		log.Error("Unable to accept quic stream", "err", err)
@@ -384,7 +403,7 @@ func (s server) handleClient(qsess quic.Session) {
 	}
 	defer qstream.Close()
 
-	qs := newQuicStream(qstream)
+	qs := newMPQuicStream(qstream)
 	for {
 		// Receive ping message
 		msg, err := qs.ReadMsg()
@@ -403,7 +422,7 @@ func (s server) handleClient(qsess quic.Session) {
 	}
 }
 
-func choosePath(interactive bool) *sd.PathReplyEntry {
+func choosePaths(interactive bool) []*sd.PathReplyEntry {
 	var paths []*sd.PathReplyEntry
 	var pathIndex uint64
 
@@ -416,6 +435,7 @@ func choosePath(interactive bool) *sd.PathReplyEntry {
 	for _, p := range pathSet {
 		paths = append(paths, p.Entry)
 	}
+	var pathIndices []uint64
 	if interactive {
 		fmt.Printf("Available paths to %v\n", remote.IA)
 		for i := range paths {
@@ -423,19 +443,37 @@ func choosePath(interactive bool) *sd.PathReplyEntry {
 		}
 		reader := bufio.NewReader(os.Stdin)
 		for {
-			fmt.Printf("Choose path: ")
+			fmt.Printf("Choose paths: ")
 			pathIndexStr, _ := reader.ReadString('\n')
 			var err error
-			pathIndex, err = strconv.ParseUint(pathIndexStr[:len(pathIndexStr)-1], 10, 64)
-			if err == nil && int(pathIndex) < len(paths) {
+			pathIndicesStr := strings.Split(pathIndexStr[:len(pathIndexStr)-1], " ")
+			for _, pathIndexStr := range pathIndicesStr {
+				pathIndex, err = strconv.ParseUint(pathIndexStr, 10, 64)
+				if err != nil || int(pathIndex) > len(paths) {
+					fmt.Fprintf(os.Stderr, "ERROR: %v: Invalid path index %v, valid indices range: [0, %v]\n",
+					err, pathIndexStr, len(paths))
+					break
+				}
+				pathIndices = append(pathIndices, pathIndex)
+			}
+			if len(pathIndices) > 0 {
+				if len(pathIndices) == 1 {
+					pathIndices = append(pathIndices, pathIndices[0])
+				}
+				fmt.Printf("len(pathIndices): %v\n", len(pathIndices))
 				break
 			}
-			fmt.Fprintf(os.Stderr, "ERROR: Invalid path index, valid indices range: [0, %v]\n",
-				len(paths))
 		}
+	} else {
+		pathIndices = append(pathIndices, pathIndex)
+		pathIndices = append(pathIndices, pathIndex)
 	}
-	fmt.Printf("Using path:\n  %s\n", paths[pathIndex].Path.String())
-	return paths[pathIndex]
+	paths = paths[pathIndices[0]:pathIndices[1]+1]
+	fmt.Println("Using paths:")
+	for _, path := range paths {
+		fmt.Printf("  %s\n", path.Path.String())
+	}
+	return paths
 }
 
 func setSignalHandler(closer io.Closer) {

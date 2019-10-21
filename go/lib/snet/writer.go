@@ -27,6 +27,7 @@ import (
 	"github.com/scionproto/scion/go/lib/pathmgr"
 	"github.com/scionproto/scion/go/lib/snet/internal/ctxmonitor"
 	"github.com/scionproto/scion/go/lib/snet/internal/pathsource"
+	"fmt"
 )
 
 // Possible write errors
@@ -71,6 +72,7 @@ func newScionConnWriter(base *scionConnBase, pr pathmgr.Resolver,
 
 // WriteToSCION sends b to raddr.
 func (c *scionConnWriter) WriteToSCION(b []byte, raddr *Addr) (int, error) {
+	//fmt.Printf("Writting to SCION: WriteToSCION raddr: %v\n", *raddr)
 	return c.write(b, raddr)
 }
 
@@ -89,7 +91,22 @@ func (c *scionConnWriter) Write(b []byte) (int, error) {
 }
 
 func (c *scionConnWriter) write(b []byte, raddr *Addr) (int, error) {
+
+	if c.base.raddr != nil && (c.base.raddr.IA != raddr.IA ||
+		!c.base.raddr.Host.L3.IP().Equal(raddr.Host.L3.IP()) || c.base.raddr.Host.L4.Port() != raddr.Host.L4.Port()) {
+		if c.base.raddr != nil {
+			fmt.Printf("scionConnWriter write: Updating raddr: New: %v\n", *raddr)
+			fmt.Printf("scionConnWriter write: Updating raddr: Previous: %v\n", c.base.raddr)
+		}
+		return 0, common.NewBasicError(ErrDuplicateAddr, nil)
+	} else {
+		fmt.Printf("scionConnWriter write: Updating raddr: New: %v\n", *raddr)
+		fmt.Printf("scionConnWriter write: Updating raddr: Previous: %v\n", c.base.raddr)
+		c.base.raddr = raddr
+		raddr = nil
+	}
 	raddr, err := c.resolver.resolveAddrPair(c.base.raddr, raddr)
+	fmt.Printf("scionConnWriter raddr.Path: %v\n", c.base.raddr.Path)
 	if err != nil {
 		return 0, err
 	}
