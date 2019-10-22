@@ -92,21 +92,23 @@ func (c *scionConnWriter) Write(b []byte) (int, error) {
 
 func (c *scionConnWriter) write(b []byte, raddr *Addr) (int, error) {
 
-	if c.base.raddr != nil && (c.base.raddr.IA != raddr.IA ||
-		!c.base.raddr.Host.L3.IP().Equal(raddr.Host.L3.IP()) || c.base.raddr.Host.L4.Port() != raddr.Host.L4.Port()) {
-		if c.base.raddr != nil {
-			fmt.Printf("scionConnWriter write: Updating raddr: New: %v\n", *raddr)
-			fmt.Printf("scionConnWriter write: Updating raddr: Previous: %v\n", c.base.raddr)
-		}
+	if c.base.raddr != nil && raddr != nil && (c.base.raddr.IA != raddr.IA ||
+		!c.base.raddr.Host.L3.IP().Equal(raddr.Host.L3.IP()) ||
+		c.base.raddr.Host.L4.Port() != raddr.Host.L4.Port()) {
 		return 0, common.NewBasicError(ErrDuplicateAddr, nil)
-	} else {
-		fmt.Printf("scionConnWriter write: Updating raddr: New: %v\n", *raddr)
-		fmt.Printf("scionConnWriter write: Updating raddr: Previous: %v\n", c.base.raddr)
+	} else if raddr != nil && (c.base.raddr == nil || fmt.Sprintf("%v", *c.base.raddr.Path) != fmt.Sprintf("%v", *raddr.Path)) {
+		fmt.Printf("scionConnWriter write: Updating raddr:\tNew:\t\t%v\n", *raddr.Path)
+		if c.base.raddr != nil {
+			fmt.Printf("scionConnWriter write: Updating raddr:\tPrevious:\t%v\n", *c.base.raddr.Path)
+		} else {
+			fmt.Printf("scionConnWriter write: Updating raddr:\tPrevious:\t%v\n", c.base.raddr)
+		}
 		c.base.raddr = raddr
+	}
+	if c.base.raddr != nil {
 		raddr = nil
 	}
 	raddr, err := c.resolver.resolveAddrPair(c.base.raddr, raddr)
-	fmt.Printf("scionConnWriter raddr.Path: %v\n", c.base.raddr.Path)
 	if err != nil {
 		return 0, err
 	}

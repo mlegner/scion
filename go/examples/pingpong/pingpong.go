@@ -301,9 +301,8 @@ func (c client) send() {
 		reqMsg := requestMsg()
 		if (i > 0) {
 			mpsquic.SwitchMPSCIONConn(c.qsess)
-			fileData = []byte("We switched the connection: AAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
-					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" +
-					"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+			infoString := "We switched the connection: "
+			fileData = []byte(infoString + strings.Repeat("A", 1400 - len(infoString)))
 			reqMsg = &message{
 				PingPong: ReqMsg,
 				Data:     fileData,

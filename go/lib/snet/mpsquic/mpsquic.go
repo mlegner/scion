@@ -41,8 +41,9 @@ type server struct {
 }
 
 var (
-	BackupPacketConns []net.PacketConn
-	BackupRemotes []*snet.Addr
+	CandidatePacketConns []net.PacketConn
+	CandidateRemotes []*snet.Addr
+	activeConnIndex int
 	activePacketConn net.PacketConn
 	qsessions []quic.Session
 	// Don't verify the server's cert, as we are not using the TLS PKI.
@@ -91,38 +92,26 @@ func DialSCIONWithBindSVC(network *snet.SCIONNetwork, laddr, raddr, baddr *snet.
 func DialMPSCIONWithBindSVC(network *snet.SCIONNetwork, laddr *snet.Addr, raddrs []*snet.Addr, baddr *snet.Addr,
 	svc addr.HostSVC, quicConfig *quic.Config) (quic.Session, error) {
 
-	fmt.Printf("len(raddrs): %v\n", len(raddrs))
-	for i, raddr := range raddrs {
+	if network == nil {
+		network = snet.DefNetwork
+	}
+	for _, raddr := range raddrs {
 		// Open as many SCION connection as we have raddrs with a different path
-
 		laddr.Host.L4 = addr.NewL4UDPInfo(laddr.Host.L4.Port() + 1)
-		fmt.Printf("DialMPSCIONWithBindSVC: raddr[%d]: %v", i, raddr)
-		//sconn, err := snet.DialSCIONWithBindSVC("udp4", laddr, raddr, nil, svc)
 
-
-		// sListen
-		//sconn, err := sListen(network, laddr, baddr, svc)
-		if network == nil {
-			network = snet.DefNetwork
-		}
 		sconn, err := network.ListenSCIONWithBindSVC("udp4", laddr, baddr, svc, 0)
-		// sListen
-
 		if err != nil {
 			return nil, err
 		}
 		fmt.Println(sconn.LocalAddr().String())
-		if i == 0 {
-			activePacketConn = sconn
-			continue
-		}
-		BackupPacketConns = append(BackupPacketConns, sconn)
-		BackupRemotes = append(BackupRemotes, raddrs[i])
-		fmt.Printf("BackupRemotes[i].Path: %v\n", BackupRemotes[i-1].Path)
+
+		CandidatePacketConns = append(CandidatePacketConns, sconn)
+		CandidateRemotes = append(CandidateRemotes, raddr)
 	}
-	fmt.Printf("len(backupPacketConns): %v\n", len(BackupPacketConns))
+	activeConnIndex = 0
+	activePacketConn = CandidatePacketConns[activeConnIndex]
 	// Use dummy hostname, as it's used for SNI, and we're not doing cert verification.
-	qsession, err := quic.Dial(activePacketConn, raddrs[0], "host:0", cliTlsCfg, quicConfig)
+	qsession, err := quic.Dial(activePacketConn, raddrs[activeConnIndex], "host:0", cliTlsCfg, quicConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -132,12 +121,17 @@ func DialMPSCIONWithBindSVC(network *snet.SCIONNetwork, laddr *snet.Addr, raddrs
 
 func SwitchMPSCIONConn(currentQuicSession quic.Session) (quic.Session, error) {
 	fmt.Println("SwitchMPSCIONConn: Started switch")
-	for i, pconn := range BackupPacketConns {
-		err := quic.SwitchPConn(&currentQuicSession, pconn)
+	for i := range CandidatePacketConns {
+		candidateIndex := (activeConnIndex + 1 + i) % len(CandidatePacketConns) // RR
+		if candidateIndex == activeConnIndex {
+			continue
+		}
+		err := quic.SwitchPConn(&currentQuicSession, CandidatePacketConns[candidateIndex])
 		if err != nil {
 			continue
 		}
-		pconn.WriteTo([]byte(""), BackupRemotes[i])
+		activePacketConn = CandidatePacketConns[candidateIndex]
+		activePacketConn.WriteTo([]byte(""), CandidateRemotes[candidateIndex])
 		return currentQuicSession, nil
 	}
 	return nil, common.NewBasicError("mpsquic: No fallback connection available.", nil)
